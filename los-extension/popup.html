@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {
+      width: 300px;
+      padding: 16px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      margin: 0;
+      background: #1a1a1a;
+      color: #ffffff;
+    }
+    
+    .header {
+      text-align: center;
+      margin-bottom: 20px;
+    }
+    
+    .header h1 {
+      font-size: 20px;
+      margin: 0 0 4px 0;
+      color: #ffffff;
+    }
+    
+    .header p {
+      font-size: 12px;
+      color: #888;
+      margin: 0;
+    }
+    
+    .status {
+      padding: 12px;
+      border-radius: 8px;
+      margin-bottom: 16px;
+      text-align: center;
+      font-size: 14px;
+    }
+    
+    .status.connected {
+      background: #1a4d1a;
+      color: #4ade80;
+      border: 1px solid #22c55e;
+    }
+    
+    .status.disconnected {
+      background: #4d1a1a;
+      color: #f87171;
+      border: 1px solid #ef4444;
+    }
+    
+    .quick-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    
+    button {
+      padding: 12px;
+      border: none;
+      border-radius: 6px;
+      background: #000000;
+      color: white;
+      cursor: pointer;
+      font-size: 14px;
+      transition: background-color 0.2s;
+    }
+    
+    button:hover {
+      background: #333333;
+    }
+    
+    button:disabled {
+      background: #444444;
+      cursor: not-allowed;
+    }
+    
+    .stats {
+      margin-top: 20px;
+      padding-top: 20px;
+      border-top: 1px solid #333;
+      font-size: 12px;
+      color: #888;
+    }
+    
+    .stats-item {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+    
+    .loading {
+      display: none;
+      text-align: center;
+      color: #888;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>LOS Clipper</h1>
+    <p>Save content to your LOS desktop app</p>
+  </div>
+  
+  <div id="status" class="status">
+    Checking connection...
+  </div>
+  
+  <div class="loading" id="loading">
+    Saving...
+  </div>
+  
+  <div class="quick-actions">
+    <button id="save-page">Save This Page</button>
+    <button id="open-los">Open LOS App</button>
+  </div>
+  
+  <div class="stats">
+    <div class="stats-item">
+      <span>Saves today:</span>
+      <strong id="saves-today">-</strong>
+    </div>
+    <div class="stats-item">
+      <span>Total saves:</span>
+      <strong id="total-saves">-</strong>
+    </div>
+  </div>
+  
+  <script src="popup.js"></script>
+</body>
+</html>

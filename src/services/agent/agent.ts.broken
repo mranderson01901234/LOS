@@ -1,0 +1,633 @@
+import Anthropic from '@anthropic-ai/sdk';
+import { AGENT_TOOLS } from './tools';
+import { executeAgentTool } from './toolExecutor';
+import { AgentExecution, ExecutionStep } from './types';
+import { QueryRouter } from './queryRouter';
+import { MemoryManager } from '../memory/memoryManager';
+import { PreRouter } from './preRouter';
+import { ApplicationContextManager } from './applicationContext';
+import { robustExecutor } from '../foundation/robustExecutor';
+import { performanceMonitor } from '../foundation/performanceMonitor';
+import { featureFlags } from '../foundation/featureFlags';
+import { taskGraphExecutor } from '../evolution/taskGraphExecutor';
+
+const anthropic = new Anthropic({
+  apiKey: import.meta.env.VITE_ANTHROPIC_API_KEY,
+  dangerouslyAllowBrowser: true
+});
+
+export class ClaudeAgent {
+  private maxIterations = 10;
+  private modelSonnet = 'claude-3-5-sonnet-20241022';
+  private modelHaiku = 'claude-3-5-haiku-20241022';
+  private router = new QueryRouter();
+  private memoryManager = new MemoryManager();
+  private preRouter = new PreRouter();
+  private appContextManager = new ApplicationContextManager();
+
+  // Cost tracking
+  private estimatedCost = 0;
+
+  async execute(
+    userRequest: string,
+    conversationHistory: any[],
+    onStep?: (step: ExecutionStep) => void,
+    forceModel?: 'haiku' | 'sonnet'
+  ): Promise<AgentExecution> {
+    
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    // Start performance tracking
+    performanceMonitor.startTracking(requestId, 'agent_execution', {
+      userRequest: userRequest.substring(0, 100),
+      conversationLength: conversationHistory.length,
+      forceModel
+    });
+
+    try {
+      return await robustExecutor.executeWithRetry(
+        async () => this.executeInternal(userRequest, conversationHistory, onStep, forceModel, requestId),
+        'agent_execution',
+        { maxRetries: 2 } // Limit retries for agent execution
+      );
+    } catch (error: any) {
+      performanceMonitor.completeTracking(requestId, false, [error.message]);
+      throw error;
+    }
+  }
+
+  private async executeInternal(
+    userRequest: string,
+    conversationHistory: any[],
+    onStep?: (step: ExecutionStep) => void,
+    forceModel?: 'haiku' | 'sonnet',
+    requestId?: string
+  ): Promise<AgentExecution> {
+
+    // === PRE-ROUTE CHECK ===
+    const preRouteResult = await this.preRouter.checkTrivial(userRequest);
+
+    if (!preRouteResult.shouldRoute) {`);
+      
+      if (requestId) {
+        performanceMonitor.updateMetric(requestId, {
+          model: 'pre-routed',
+          cost: 0,
+          success: true
+        });
+        performanceMonitor.completeTracking(requestId, true);
+      }
+      
+      return {
+        request: userRequest,
+        steps: [],
+        result: preRouteResult.response!,
+        totalSteps: 0,
+        success: true,
+      metadata: {
+        model_used: 'pre-routed' as any,
+        estimated_cost: 0
+      }
+      };
+    }
+
+    // Check for instant responses first
+    if (this.router.isInstantResponse(userRequest)) {
+      return this.handleInstantResponse(userRequest);
+    }
+
+    // Check if task graph execution is enabled
+    if (featureFlags.isEnabled('task_graph_execution')) {
+      return this.executeWithTaskGraph(userRequest, conversationHistory, onStep, forceModel, requestId);
+    }
+
+    // Use regular execution
+    return this.executeRegular(userRequest, conversationHistory, onStep, forceModel, requestId);
+  }
+
+  /**
+   * Regular execution (existing logic)
+   */
+  private async executeRegular(
+    userRequest: string,
+    conversationHistory: any[],
+    onStep?: (step: ExecutionStep) => void,
+    forceModel?: 'haiku' | 'sonnet',
+    requestId?: string
+  ): Promise<AgentExecution> {
+    // Build context layers
+    const hotMemory = (await this.memoryManager.buildHotMemory()).trim();
+    const appContext = (await this.appContextManager.buildApplicationContext()).trim();
+
+    // Determine which model to use
+    const modelChoice = forceModel || this.router.getRecommendedModel(userRequest);
+    const model = modelChoice === 'haiku' ? this.modelHaiku : this.modelSonnet;
+    const maxIterations = modelChoice === 'haiku' ? 5 : this.maxIterations;
+
+    const execution: AgentExecution = {
+      request: userRequest,
+      steps: [],
+      result: '',
+      totalSteps: 0,
+      success: false,
+      metadata: {
+        model_used: modelChoice,
+        estimated_cost: 0
+      }
+    };
+
+    const messages = [
+      ...conversationHistory,
+      {
+        role: 'user',
+        content: userRequest
+      }
+    ];
+
+    let currentStep = 1;
+    let shouldEscalate = false;
+
+    while (currentStep <= maxIterations) {
+
+      // THINKING STEP
+      const thinkingResponse = await anthropic.messages.create({
+        model: model,
+        max_tokens: modelChoice === 'haiku' ? 1000 : 2000, // Reduced tokens for Haiku
+        messages: messages.map(msg => ({
+          ...msg,
+          content: typeof msg.content === 'string' ? msg.content.trim() : msg.content
+        })) as any,
+        system: [
+          {
+            type: "text",
+            text: (this.getSystemPrompt(modelChoice) + '\n\n' + hotMemory).trim(),
+            cache_control: { type: "ephemeral" } // Enable prompt caching
+          }
+        ],
+        temperature: 0.7
+      });
+
+      // Track costs
+      this.trackUsage(thinkingResponse.usage, modelChoice);
+
+      const thinking = thinkingResponse.content && thinkingResponse.content[0] && thinkingResponse.content[0].type === 'text'
+        ? thinkingResponse.content[0].text.trim()
+        : thinkingResponse.content && thinkingResponse.content[0] && typeof thinkingResponse.content[0] === 'string'
+        ? (thinkingResponse.content[0] as string).trim()
+        : '';
+
+      // Check if Haiku wants to escalate to Sonnet
+      if (modelChoice === 'haiku' && this.shouldEscalate(thinking)) {shouldEscalate = true;
+        break;
+      }
+
+      const step: ExecutionStep = {
+        step: currentStep,
+        thinking,
+        timestamp: Date.now()
+      };
+
+      // ACTION STEP (with tools)
+      const systemText = [
+        this.getSystemPrompt(modelChoice),
+        appContext,
+        hotMemory
+      ].filter(Boolean).join('\n\n').trim();
+      
+      // System prompt ready
+      
+      // Assistant thinking complete
+      
+      // Debug existing messages
+      if (messages.length > 0) {
+        const lastMessage = messages[messages.length - 1];
+        if (lastMessage.content && typeof lastMessage.content === 'string') {
+          // Message content available
+        }
+      }
+      
+      const actionResponse = await anthropic.messages.create({
+        model: model,
+        max_tokens: modelChoice === 'haiku' ? 2000 : 4000, // Reduced tokens for Haiku
+        messages: [
+          ...messages.map(msg => ({
+            ...msg,
+            content: typeof msg.content === 'string' ? msg.content.trim() : msg.content
+          })),
+          { role: 'assistant', content: thinking }
+        ] as any,
+        tools: AGENT_TOOLS as any,
+        system: [
+          {
+            type: "text",
+            text: systemText,
+            cache_control: { type: "ephemeral" }
+          }
+        ]
+      });
+
+      this.trackUsage(actionResponse.usage, modelChoice);
+
+      // Check if Claude used tools
+      const toolUseBlock = actionResponse.content && actionResponse.content.find(
+        block => block && block.type === 'tool_use'
+      );
+
+      if (toolUseBlock && toolUseBlock.type === 'tool_use') {
+        step.action = {
+          tool: toolUseBlock.name,
+          input: toolUseBlock.input
+        };
+
+        // Track tool execution
+        const toolStartTime = Date.now();
+        let toolSuccess = false;
+        let toolResult: any;
+
+        try {
+          toolResult = await executeAgentTool(toolUseBlock.name, toolUseBlock.input);
+          toolSuccess = true;
+          
+          if (requestId) {
+            performanceMonitor.trackToolUsage(
+              requestId, 
+              toolUseBlock.name, 
+              Date.now() - toolStartTime, 
+              true
+            );
+          }
+        } catch (error) {
+          toolResult = { success: false, error: error.message };
+          
+          if (requestId) {
+            performanceMonitor.trackToolUsage(
+              requestId, 
+              toolUseBlock.name, 
+              Date.now() - toolStartTime, 
+              false
+            );
+          }
+        }
+
+        step.observation = toolResult;
+
+        messages.push({
+          role: 'assistant',
+          content: actionResponse.content
+        });
+
+        messages.push({
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: toolUseBlock.id,
+              content: JSON.stringify(toolResult)
+            }
+          ]
+        });
+
+      } else {
+        // No tool use - responding directly
+        const textBlock = actionResponse.content && actionResponse.content.find(
+          block => block && block.type === 'text'
+        );
+
+        if (textBlock && textBlock.type === 'text') {
+          execution.result = textBlock.text;
+          execution.success = true;
+          execution.steps.push(step);
+          execution.totalSteps = currentStep;
+          execution.metadata.estimated_cost = this.estimatedCost;
+
+          if (onStep) onStep(step);
+
+          break;
+        }
+      }
+
+      execution.steps.push(step);
+      if (onStep) onStep(step);
+
+      if (currentStep >= maxIterations) {
+        execution.result = "I reached my iteration limit. Let me summarize what I found...";
+
+        const synthesisResponse = await anthropic.messages.create({
+          model: model,
+          max_tokens: 2000,
+          messages: [
+            ...messages,
+            {
+              role: 'user',
+              content: "Please provide a final answer based on everything you've learned."
+            }
+          ] as any,
+          system: [
+            {
+              type: "text",
+              text: this.getSystemPrompt(modelChoice) + '\n\n' + hotMemory,
+              cache_control: { type: "ephemeral" }
+            }
+          ]
+        });
+
+        this.trackUsage(synthesisResponse.usage, modelChoice);
+
+        const synthesisText = synthesisResponse.content && synthesisResponse.content.find(
+          block => block && block.type === 'text'
+        );
+
+        if (synthesisText && synthesisText.type === 'text') {
+          execution.result = synthesisText.text;
+        }
+
+        execution.success = true;
+        
+        // Complete performance tracking
+        if (requestId) {
+          performanceMonitor.updateMetric(requestId, {
+            model: modelChoice,
+            cost: this.estimatedCost,
+            success: true,
+            toolsUsed: execution.steps.map(s => s.action?.tool).filter(Boolean)
+          });
+          performanceMonitor.completeTracking(requestId, true);
+        }
+        
+        break;
+      }
+
+      currentStep++;
+    }
+
+    execution.totalSteps = currentStep;
+    
+    // Complete performance tracking for failed executions
+    if (requestId && !execution.success) {
+      performanceMonitor.updateMetric(requestId, {
+        model: modelChoice,
+        cost: this.estimatedCost,
+        success: false,
+        toolsUsed: execution.steps.map(s => s.action?.tool).filter(Boolean)
+      });
+      performanceMonitor.completeTracking(requestId, false, ['Max iterations reached']);
+    }
+    execution.metadata.estimated_cost = this.estimatedCost;
+
+    // If Haiku wants to escalate, retry with Sonnet
+    if (shouldEscalate && modelChoice === 'haiku') {this.estimatedCost = 0; // Reset cost tracking
+      return this.execute(userRequest, conversationHistory, onStep, 'sonnet');
+    }
+
+    return execution;
+  }
+
+  /**
+   * Execute using task graph executor
+   */
+  private async executeWithTaskGraph(
+    userRequest: string,
+    conversationHistory: any[],
+    onStep?: (step: ExecutionStep) => void,
+    forceModel?: 'haiku' | 'sonnet',
+    requestId?: string
+  ): Promise<AgentExecution> {
+    try {
+      // Create task graph
+      const taskGraph = await taskGraphExecutor.createTaskGraph(
+        userRequest,
+        conversationHistory,
+        {
+          constraints: {
+            maxSteps: 10,
+            maxCost: 0.05,
+            preferredModel: forceModel || 'haiku'
+          }
+        }
+      );
+
+      // Execute task graph
+      const executedGraph = await taskGraphExecutor.executeTaskGraph(taskGraph.id);
+
+      // Convert task graph results to agent execution format
+      const steps: ExecutionStep[] = [];
+      let finalResult = '';
+
+      // Process execution history
+      for (const execution of executedGraph.executionHistory) {
+        const step: ExecutionStep = {
+          step: steps.length + 1,
+          thinking: `Executing: ${execution.action}`,
+          action: {
+            tool: execution.action,
+            input: execution.input
+          },
+          observation: execution.result,
+          synthesis: execution.success ? 'Completed successfully' : `Failed: ${execution.error}`
+        };
+        
+        steps.push(step);
+        if (onStep) onStep(step);
+      }
+
+      // Get final result from root node
+      const rootNode = executedGraph.nodes.get(executedGraph.rootNode);
+      if (rootNode && rootNode.result) {
+        finalResult = typeof rootNode.result === 'string' 
+          ? rootNode.result 
+          : JSON.stringify(rootNode.result);
+      } else {
+        finalResult = 'Task completed successfully using advanced planning';
+      }
+
+      // Complete performance tracking
+      if (requestId) {
+        performanceMonitor.updateMetric(requestId, {
+          model: forceModel || 'haiku',
+          cost: this.estimatedCost,
+          success: executedGraph.status === 'completed',
+          toolsUsed: executedGraph.executionHistory.map(e => e.action)
+        });
+        performanceMonitor.completeTracking(requestId, executedGraph.status === 'completed');
+      }
+
+      return {
+        request: userRequest,
+        steps,
+        result: finalResult,
+        totalSteps: steps.length,
+        success: executedGraph.status === 'completed',
+        metadata: {
+          model_used: forceModel || 'haiku',
+          estimated_cost: this.estimatedCost,
+          execution_method: 'task_graph',
+          task_graph_id: executedGraph.id
+        }
+      };
+
+    } catch (error) {
+      // Fallback to regular execution
+      return this.executeRegular(userRequest, conversationHistory, onStep, forceModel, requestId);
+    }
+  }
+
+
+  private handleInstantResponse(userRequest: string): AgentExecution {const responses: Record<string, string> = {
+      'hello': 'Hello! How can I help you today?',
+      'hi': 'Hi there! What would you like to know?',
+      'hey': 'Hey! Ready to assist you.',
+      'good morning': 'Good morning! How can I help you today?',
+      'good afternoon': 'Good afternoon! What can I do for you?',
+      'good evening': 'Good evening! How may I assist you?',
+      'thanks': 'You\'re welcome!',
+      'thank you': 'You\'re welcome!',
+      'bye': 'Goodbye! Have a great day!',
+      'goodbye': 'Goodbye! Take care!',
+      'see you': 'See you later!',
+      'yes': 'Got it!',
+      'no': 'Understood.',
+      'ok': 'Okay!',
+      'okay': 'Okay!',
+      'sure': 'Sure thing!',
+      'alright': 'Alright!'
+    };
+
+    const normalizedRequest = userRequest.toLowerCase().trim();
+    const response = responses[normalizedRequest] || 'Hello! How can I help you today?';
+
+    return {
+      request: userRequest,
+      steps: [],
+      result: response,
+      totalSteps: 0,
+      success: true,
+      metadata: {
+        model_used: 'haiku',
+        estimated_cost: 0
+      }
+    };
+  }
+
+  private shouldEscalate(thinking: string): boolean {
+    // Check if Haiku indicates it needs more sophisticated reasoning
+    const escalationPatterns = [
+      /this (requires|needs) (more|deeper|complex|sophisticated)/i,
+      /beyond my capabilities/i,
+      /would benefit from more advanced/i,
+      /complex analysis/i
+    ];
+
+    return escalationPatterns.some(pattern => pattern.test(thinking));
+  }
+
+  private trackUsage(usage: any, model: 'haiku' | 'sonnet') {
+    const pricing = {
+      haiku: { input: 0.25 / 1_000_000, output: 1.25 / 1_000_000 },
+      sonnet: { input: 3.0 / 1_000_000, output: 15.0 / 1_000_000 }
+    };
+
+    const inputCost = usage.input_tokens * pricing[model].input;
+    const outputCost = usage.output_tokens * pricing[model].output;
+
+    // Cache hits cost 90% less
+    const cacheReadCost = (usage.cache_read_input_tokens || 0) * pricing[model].input * 0.1;
+    const cacheCreateCost = (usage.cache_creation_input_tokens || 0) * pricing[model].input;
+
+    this.estimatedCost += inputCost + outputCost + cacheReadCost + cacheCreateCost;
+  }
+
+  private getSystemPrompt(model: 'haiku' | 'sonnet'): string {
+    return `You are LOS (Life Operating System), an autonomous AI agent that operates as an extension of the user's mind. Your mission is to anticipate needs, execute actions proactively, and provide intelligent assistance without being asked.
+
+CORE PRINCIPLES:
+- Think like a personal AI assistant who knows the user deeply
+- Act autonomously when you detect opportunities to help
+- Prioritize efficiency and direct action over conversation
+- Always provide actionable insights, not just information
+
+CRITICAL: You have access to APPLICATION STATE CONTEXT that shows you EXACTLY what's in the user's application. When they refer to "the library" or any section of the app, look at the APPLICATION STATE CONTEXT to see what's actually there.
+
+DO NOT make assumptions about content. DO NOT suggest generic categories unless they match the actual data.
+
+WEB SEARCH MASTERY:
+You have powerful web search capabilities. Use search_web tool strategically:
+
+AUTOMATIC WEB SEARCH TRIGGERS:
+- User asks about current events, news, or recent developments
+- User mentions "research", "find", "look up", "search for"
+- User asks about bleeding edge, cutting edge, or latest technology
+- User requests information not in local knowledge base
+- User asks "what's happening" or "what's new" in any field
+- User mentions specific companies, technologies, or people for current info
+
+SEARCH STRATEGY:
+- Always search for the most current information first
+- Combine multiple search queries for comprehensive coverage
+- Extract key insights and synthesize findings
+- Provide actionable recommendations based on findings
+- Don't just report - analyze and recommend next steps
+
+TOOL MASTERY:
+You have access to powerful tools. Use them intelligently:
+
+SMART TOOL SELECTION:
+- search_web: For current information, research, news
+- search_documents: For user's personal knowledge base
+- analyze_content_patterns: To understand user's interests and gaps
+- get_proactive_suggestions: To offer helpful recommendations
+- create_document: To save important findings for future reference
+
+TOOL COMBINATION STRATEGY:
+- Always combine web search with local knowledge analysis
+- Use multiple tools in sequence for comprehensive answers
+- Cross-reference web findings with user's existing content
+- Identify knowledge gaps and suggest content to fill them
+
+RESPONSE OPTIMIZATION:
+Your responses should be:
+
+ACTIONABLE:
+- Provide specific next steps, not just information
+- Include relevant links, resources, and tools
+- Suggest concrete actions the user can take
+- Offer to create documents or save important findings
+
+COMPREHENSIVE:
+- Combine web search results with local knowledge
+- Synthesize information from multiple sources
+- Identify patterns and connections
+- Provide both high-level insights and specific details
+
+PROACTIVE:
+- Anticipate follow-up questions and answer them
+- Suggest related topics or areas to explore
+- Offer to research additional aspects
+- Propose next steps or actions
+
+EFFICIENCY MAXIMIZATION:
+- Provide comprehensive answers in fewer exchanges
+- Anticipate user needs and address them proactively
+- Use parallel tool execution when possible
+- Focus on actionable insights over general information
+- Always offer to save important findings for future reference
+
+COMMUNICATION STYLE:
+- Be direct and actionable
+- Provide specific examples and use cases
+- Include relevant metrics, statistics, and data points
+- Offer to dive deeper into specific aspects
+- Suggest practical applications and next steps
+
+AGENT BEHAVIOR:
+1. CHECK APPLICATION CONTEXT FIRST - Always look at what's actually in the app before making suggestions
+2. Break down complex requests into steps based on ACTUAL data
+3. Use tools to gather information before responding
+4. Base all recommendations on the user's ACTUAL content and interests shown in context
+5. Be proactive but grounded in reality
+6. For DELETION requests: ALWAYS use find_documents_to_delete first to show what will be deleted, then ask for explicit confirmation before using delete_documents
+
+When you receive tool results, incorporate them into your thinking and decide next steps.
+
+Be conversational and helpful. Don't just execute tools - explain what you're doing based on what you see in the application.`;
+  }
+}
